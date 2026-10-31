@@ -1,8 +1,10 @@
 import PySide6.QtWidgets as pswidg
 from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, QRunnable, Slot, QThreadPool
 import serial
 from serial.tools.list_ports import comports
+from time import sleep
+import queue
 
 # Global aesthetic configs
 INPUT_FIELDS_W = 80
@@ -12,8 +14,14 @@ class MainWindow(pswidg.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        # Serial port instance
-        self.serial = None
+        # Serial port instance and control
+        self.serial = serial.Serial()
+        self.commandQueue = queue.Queue() # to prevent race conditions
+        # UARTWorker commands (the $ prefix is used because there are no dollar signs in COM names)
+        # ---
+        # $CLOSE - close the serial connection;
+        # $QUIT - the application is being closed, time to leave;
+        # anything else - tries to connect to that port with the given parameters.
 
         self.setWindowTitle("Multichannel Experimental Data Reader")
         primaryContainer = pswidg.QWidget()
@@ -27,27 +35,51 @@ class MainWindow(pswidg.QMainWindow):
         # Controls bar
         controlsContainer = pswidg.QWidget()
         controlsLayout = pswidg.QHBoxLayout(controlsContainer)
+
+        # UART Port selector
         portLabel = pswidg.QLabel("Порт:")
         self.portCBox = pswidg.QComboBox()
         self.portCBox.addItem(DISCONNECT_LITERAL)
         self.portCBox.currentTextChanged.connect(self.setUART)
+
+        # Baudrate
         baudrateLabel = pswidg.QLabel("Швидкість передачі:")
-        self.baudrateLE = pswidg.QLineEdit(text='9600')
-        self.baudrateLE.setValidator(self.positiveOnly)
-        self.baudrateLE.setFixedWidth(INPUT_FIELDS_W)
-        NBitsLabel = pswidg.QLabel("К-ть бітів даних:")
+        self.baudrateCBox = pswidg.QComboBox()
+        self.baudrateCBox.addItems(
+            ('50', '75', '110', '134', '150', '200', '300', '600', '1200', '1800', \
+            '2400', '4800', '9600', '19200', '28800', '38400', '57600', '76800', \
+            '115200', '230400', '460800', '576000', '921600') # standard baudrates
+        )
+        self.baudrateCBox.setCurrentText('9600') # this is by far the most standard baudrate along with 115200
+        self.baudrateCBox.setEditable(True)
+        self.baudrateCBox.setValidator(self.positiveOnly)
+
+        # Data bits
+        NBitsLabel = pswidg.QLabel("Бітів даних:")
         self.NBitsCBox = pswidg.QComboBox()
         self.NBitsCBox.addItems(('8','7','6','5')) # PySerial allows only these
+
+        # Parity
         parityLabel = pswidg.QLabel("Парність:")
         self.parityCBox = pswidg.QComboBox()
         self.parityCBox.addItems(('None', 'Even', 'Odd', 'Mark', 'Space'))
-        stopLabel = pswidg.QLabel("Стоп-біти:")
+
+        # Stop bits
+        stopLabel = pswidg.QLabel("Стоп-бітів:")
         self.stopCBox = pswidg.QComboBox()
         self.stopCBox.addItems(('1', '2', '1.5'))
+
+        # Channel amount
         nChanLabel = pswidg.QLabel("Каналів:")
         nChanCBox = pswidg.QComboBox()
         nChanCBox.addItems(('1', '2', '3', '4'))
         nChanCBox.currentTextChanged.connect(self.updateChannelLayout)
+
+        # Making on-the-fly adjustments possible
+        self.baudrateCBox.currentTextChanged.connect(self.setUART)
+        self.NBitsCBox.currentTextChanged.connect(self.setUART)
+        self.parityCBox.currentTextChanged.connect(self.setUART)
+        self.stopCBox.currentTextChanged.connect(self.setUART)
 
         # Separator line
         separator = pswidg.QFrame()
@@ -62,13 +94,14 @@ class MainWindow(pswidg.QMainWindow):
         # discr - discretization frequency
         # scale - scaling coefficient
         # zeroOffset - zero offset
+        # output - data display controller
         self.channelComponents = [] # used for later data retrieval
 
         # integration
         controlsLayout.addWidget(portLabel)
         controlsLayout.addWidget(self.portCBox)
         controlsLayout.addWidget(baudrateLabel)
-        controlsLayout.addWidget(self.baudrateLE)
+        controlsLayout.addWidget(self.baudrateCBox)
         controlsLayout.addWidget(NBitsLabel)
         controlsLayout.addWidget(self.NBitsCBox)
         controlsLayout.addWidget(parityLabel)
@@ -91,6 +124,10 @@ class MainWindow(pswidg.QMainWindow):
         self.refreshTimer.timeout.connect(self.refreshUART)
         self.refreshTimer.start()
 
+        # UART communication handler thread
+        self.threadPool = QThreadPool(self)
+        self.UARTWorker = UARTWorker(self)
+        self.threadPool.start(self.UARTWorker)
 
     def updateChannelLayout(self) -> None:
         required = int(self.sender().currentText())
@@ -179,10 +216,10 @@ class MainWindow(pswidg.QMainWindow):
             self.portCBox.addItem(item)
 
     def setUART(self) -> None:
-        chnl = self.sender().currentText()
-        baudrate = int(self.baudrateLE.text())
-        nBits = int(self.NBitsCBox.currentText())
-        stopbits = float(self.stopCBox.currentText())
+        port = self.portCBox.currentText()
+        baudrate = self.baudrateCBox.currentText()
+        nBits = self.NBitsCBox.currentText()
+        stopbits = self.stopCBox.currentText()
         parityMap = {
             "None" : serial.PARITY_NONE,
             "Even": serial.PARITY_EVEN,
@@ -190,24 +227,52 @@ class MainWindow(pswidg.QMainWindow):
             "Mark": serial.PARITY_MARK,
             "Space": serial.PARITY_SPACE
         }
-        if not self.serial is None:
-            if(self.serial.is_open):
-                self.serial.close()
 
-        if not chnl == DISCONNECT_LITERAL: # if the channel is set to the disconnect literal, the UART is simply left closed.
-            self.serial = serial.Serial(
-                chnl,
-                baudrate,
-                nBits,
-                parityMap[self.parityCBox.currentText()],
-                stopbits
-            )
+        if port == DISCONNECT_LITERAL:
+            self.commandQueue.put_nowait('$CLOSE')
+        else:
+            self.commandQueue.put_nowait(f'{port} {baudrate} {nBits} {parityMap[self.parityCBox.currentText()]} {stopbits}')
 
     def cleanup(self) -> None: # releases UART ports, saves all files, etc when quitting the app
-        if not self.serial is None:
-            if(self.serial.is_open):
-                self.serial.close()
+        # self.isRunning = False
+        self.commandQueue.put_nowait('$QUIT')
 
+class UARTWorker(QRunnable):
+    def __init__(self, mainwindow: MainWindow) -> None:
+        super().__init__()
+        self.mainwindow = mainwindow
+
+    @Slot()
+    def run(self) -> None:
+        isRunning = True
+        while isRunning:
+
+            if not self.mainwindow.commandQueue.empty():
+                command = self.mainwindow.commandQueue.get_nowait()
+                self.mainwindow.serial.close()
+                print(f'> {command}')
+                match command:
+                    case '$CLOSE': pass
+                    case '$QUIT': isRunning = False
+                    case other:
+                        params = other.split()
+                        self.mainwindow.serial = serial.Serial(
+                            port=params[0],
+                            baudrate=int(params[1]),
+                            bytesize=int(params[2]),
+                            parity=params[3],
+                            stopbits=float(params[4]),
+                            timeout=5
+                        )
+
+            if(self.mainwindow.serial.is_open):
+                databytes = self.mainwindow.serial.readline()
+                datatext = str(databytes, encoding='ascii').strip()
+                print(datatext)
+                # self.mainwindow.channelComponents[0]['output'].setText(f'Значення {datatext}')
+            else:
+                sleep(0.1) # to prevent GUI performance sagging by the thread
+        
 main = pswidg.QApplication()
 
 win = MainWindow()
