@@ -16,12 +16,20 @@ class MainWindow(pswidg.QMainWindow):
 
         # Serial port instance and control
         self.serial = serial.Serial()
-        self.commandQueue = queue.Queue() # to prevent race conditions
+        self.commandQueue = queue.Queue() # to prevent race conditions such as trying to change the port during a read
         # UARTWorker commands (the $ prefix is used because there are no dollar signs in COM names)
         # ---
         # $CLOSE - close the serial connection;
         # $QUIT - the application is being closed, time to leave;
         # anything else - tries to connect to that port with the given parameters.
+
+        self.dataQueue = queue.Queue() # to prevent the UARTWorker raising RuntimeErrors due to the widget already being destroyed
+        self.dataBuffer = [ # This is a temporary data displaying solution.
+            [0,0,0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0,0]
+        ]
 
         self.setWindowTitle("Multichannel Experimental Data Reader")
         primaryContainer = pswidg.QWidget()
@@ -118,9 +126,13 @@ class MainWindow(pswidg.QMainWindow):
         self.setCentralWidget(primaryContainer)
         self.createChannel(0)
 
+        self.status = pswidg.QStatusBar(self) # For displaying warning messages
+        self.status.setSizeGripEnabled(False)
+        self.setStatusBar(self.status)
+
         # Port list refresher
         self.refreshTimer = QTimer(self)
-        self.refreshTimer.setInterval(500)
+        self.refreshTimer.setInterval(100)
         self.refreshTimer.timeout.connect(self.refreshUART)
         self.refreshTimer.start()
 
@@ -129,7 +141,29 @@ class MainWindow(pswidg.QMainWindow):
         self.UARTWorker = UARTWorker(self)
         self.threadPool.start(self.UARTWorker)
 
+        # Data pull timer (timers terminate together with the MainWindow, so no RuntimeErrors occur)
+        self.dataPullTimer = QTimer(self)
+        self.dataPullTimer.setInterval(1)
+        self.dataPullTimer.timeout.connect(self.pullData)
+        self.dataPullTimer.start()
+
+    def pullData(self) -> None: # TODO add formatting chooser
+        while not self.dataQueue.empty():
+            databytes = self.dataQueue.get_nowait()
+            dataIn = str(databytes, encoding='ascii').split()
+            nChannels = len(self.channelComponents)
+            if(len(dataIn)>nChannels):
+                self.status.showMessage(f'⚠️ Забагато даних на вході, відображаються {nChannels}/{len(dataIn)} каналів.')
+
+            for i in range(min(len(dataIn), nChannels)):
+                scaling = float(self.channelComponents[i]['scale'].text())
+                zeroOffset = float(self.channelComponents[i]['zeroOffset'].text())
+                self.dataBuffer[i][0:9] = self.dataBuffer[i][1:]
+                self.dataBuffer[i][9] = float(dataIn[i])*scaling+zeroOffset
+                self.channelComponents[i]['output'].setText(f'Значення: {self.dataBuffer[i]}')
+
     def updateChannelLayout(self) -> None:
+        """Expands or contracts the number of channels to match the amount required."""
         required = int(self.sender().currentText())
         current = len(self.channelComponents)
 
@@ -143,6 +177,7 @@ class MainWindow(pswidg.QMainWindow):
                 self.createChannel(i) # create appropriate channels
 
     def createChannel(self, ident: int) -> None:
+        """Spawns a new channel widget with the given identifier, and adds it to the grid."""
         comp = pswidg.QWidget()
         VBLayout = pswidg.QVBoxLayout(comp)
         chName = pswidg.QLabel(f'Канал №{ident+1}')
@@ -193,6 +228,7 @@ class MainWindow(pswidg.QMainWindow):
         self.channelComponents.append(compdict)
 
     def refreshUART(self) -> None:
+        """Updates the portCBox combobox to reflect the amount of UARTs available."""
         uarts = [DISCONNECT_LITERAL]
 
         for port in comports():
@@ -216,6 +252,7 @@ class MainWindow(pswidg.QMainWindow):
             self.portCBox.addItem(item)
 
     def setUART(self) -> None:
+        """Sends appropriate commands to the UARTWorker to update its config."""
         port = self.portCBox.currentText()
         baudrate = self.baudrateCBox.currentText()
         nBits = self.NBitsCBox.currentText()
@@ -246,32 +283,33 @@ class UARTWorker(QRunnable):
     def run(self) -> None:
         isRunning = True
         while isRunning:
+            try:
+                if not self.mainwindow.commandQueue.empty():
+                    command = self.mainwindow.commandQueue.get_nowait()
+                    self.mainwindow.serial.close()
+                    print(f'> {command}')
+                    match command:
+                        case '$CLOSE': pass
+                        case '$QUIT': isRunning = False
+                        case other:
+                            params = other.split()
+                            self.mainwindow.serial = serial.Serial(
+                                port=params[0],
+                                baudrate=int(params[1]),
+                                bytesize=int(params[2]),
+                                parity=params[3],
+                                stopbits=float(params[4]),
+                                timeout=5
+                            )
 
-            if not self.mainwindow.commandQueue.empty():
-                command = self.mainwindow.commandQueue.get_nowait()
+                if(self.mainwindow.serial.is_open):
+                    databytes = self.mainwindow.serial.readline()
+                    self.mainwindow.dataQueue.put_nowait(databytes)
+                else:
+                    sleep(0.1) # to prevent GUI performance sagging by the thread
+            except serial.SerialException as exc:
                 self.mainwindow.serial.close()
-                print(f'> {command}')
-                match command:
-                    case '$CLOSE': pass
-                    case '$QUIT': isRunning = False
-                    case other:
-                        params = other.split()
-                        self.mainwindow.serial = serial.Serial(
-                            port=params[0],
-                            baudrate=int(params[1]),
-                            bytesize=int(params[2]),
-                            parity=params[3],
-                            stopbits=float(params[4]),
-                            timeout=5
-                        )
-
-            if(self.mainwindow.serial.is_open):
-                databytes = self.mainwindow.serial.readline()
-                datatext = str(databytes, encoding='ascii').strip()
-                print(datatext)
-                # self.mainwindow.channelComponents[0]['output'].setText(f'Значення {datatext}')
-            else:
-                sleep(0.1) # to prevent GUI performance sagging by the thread
+                self.mainwindow.status.showMessage(f'⚠️ Помилка послідовного порту! {repr(exc)}')
         
 main = pswidg.QApplication()
 
