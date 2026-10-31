@@ -89,9 +89,14 @@ class MainWindow(pswidg.QMainWindow):
         self.parityCBox.currentTextChanged.connect(self.setUART)
         self.stopCBox.currentTextChanged.connect(self.setUART)
 
+        # Text data separator
+        sepLabel = pswidg.QLabel('Роздільник: ')
+        self.separator = pswidg.QLineEdit()
+        self.separator.setFixedWidth(INPUT_FIELDS_W)
+
         # Separator line
-        separator = pswidg.QFrame()
-        separator.setFrameShape(pswidg.QFrame.Shape.HLine)
+        guiSeparator = pswidg.QFrame()
+        guiSeparator.setFrameShape(pswidg.QFrame.Shape.HLine)
 
         # Grid layout for channels
         channels = pswidg.QWidget()
@@ -105,7 +110,7 @@ class MainWindow(pswidg.QMainWindow):
         # output - data display controller
         self.channelComponents = [] # used for later data retrieval
 
-        # integration
+        # Control panel integration
         controlsLayout.addWidget(portLabel)
         controlsLayout.addWidget(self.portCBox)
         controlsLayout.addWidget(baudrateLabel)
@@ -118,9 +123,11 @@ class MainWindow(pswidg.QMainWindow):
         controlsLayout.addWidget(self.stopCBox)
         controlsLayout.addWidget(nChanLabel)        
         controlsLayout.addWidget(nChanCBox)
+        controlsLayout.addWidget(sepLabel)
+        controlsLayout.addWidget(self.separator)
 
         primaryLayout.addWidget(controlsContainer)
-        primaryLayout.addWidget(separator)
+        primaryLayout.addWidget(guiSeparator)
         primaryLayout.addWidget(channels)
 
         self.setCentralWidget(primaryContainer)
@@ -147,20 +154,32 @@ class MainWindow(pswidg.QMainWindow):
         self.dataPullTimer.timeout.connect(self.pullData)
         self.dataPullTimer.start()
 
-    def pullData(self) -> None: # TODO add formatting chooser
+    def pullData(self) -> None:
         while not self.dataQueue.empty():
             databytes = self.dataQueue.get_nowait()
-            dataIn = str(databytes, encoding='ascii').split()
-            nChannels = len(self.channelComponents)
-            if(len(dataIn)>nChannels):
-                self.status.showMessage(f'⚠️ Забагато даних на вході, відображаються {nChannels}/{len(dataIn)} каналів.')
+            sep = self.separator.text()
+            try:
+                dataIn = str(databytes, encoding='ascii').split(sep if sep else ' ')
+                nChannels = len(self.channelComponents)
 
-            for i in range(min(len(dataIn), nChannels)):
-                scaling = float(self.channelComponents[i]['scale'].text())
-                zeroOffset = float(self.channelComponents[i]['zeroOffset'].text())
-                self.dataBuffer[i][0:9] = self.dataBuffer[i][1:]
-                self.dataBuffer[i][9] = float(dataIn[i])*scaling+zeroOffset
-                self.channelComponents[i]['output'].setText(f'Значення: {self.dataBuffer[i]}')
+                for i in range(min(len(dataIn), nChannels)):
+                    try:
+                        scaleStr = self.channelComponents[i]['scale'].text().replace(',','.')
+                        zeroOffStr = self.channelComponents[i]['zeroOffset'].text().replace(',','.')
+                        scaling = float(scaleStr if scaleStr else '1')
+                        zeroOffset = float(zeroOffStr if zeroOffStr else '0')
+                        inputModified = float(dataIn[i])*scaling+zeroOffset # to raise ValueError as early as possible in case of wrong code
+                        self.dataBuffer[i][0:9] = self.dataBuffer[i][1:]
+                        self.dataBuffer[i][9] = inputModified
+                        self.channelComponents[i]['output'].setText(f'Значення: {self.dataBuffer[i]}')
+                        self.status.showMessage('Дані прийнято без помилок.')
+                    except ValueError:
+                        self.status.showMessage(f'⚠️ Некоректні параметри або дані на вході каналу №{i+1}: {dataIn[i]}')
+
+                if(len(dataIn)>nChannels):
+                    self.status.showMessage(f'Забагато даних на вході, відображаються {nChannels}/{len(dataIn)} каналів.')
+            except UnicodeDecodeError:
+                self.status.showMessage(f'⚠️ Неможливо декодувати символи.')
 
     def updateChannelLayout(self) -> None:
         """Expands or contracts the number of channels to match the amount required."""
@@ -293,14 +312,15 @@ class UARTWorker(QRunnable):
                         case '$QUIT': isRunning = False
                         case other:
                             params = other.split()
-                            self.mainwindow.serial = serial.Serial(
-                                port=params[0],
-                                baudrate=int(params[1]),
-                                bytesize=int(params[2]),
-                                parity=params[3],
-                                stopbits=float(params[4]),
-                                timeout=5
-                            )
+                            if(len(params) == 5):
+                                self.mainwindow.serial = serial.Serial(
+                                    port=params[0],
+                                    baudrate=int(params[1]),
+                                    bytesize=int(params[2]),
+                                    parity=params[3],
+                                    stopbits=float(params[4]),
+                                    timeout=5
+                                )
 
                 if(self.mainwindow.serial.is_open):
                     databytes = self.mainwindow.serial.readline()
