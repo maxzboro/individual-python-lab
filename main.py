@@ -1,14 +1,28 @@
 import PySide6.QtWidgets as pswidg
-from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator
+from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator, QFont
 from PySide6.QtCore import QTimer, QRunnable, Slot, QThreadPool
 import serial
 from serial.tools.list_ports import comports
 from time import sleep
 import queue
+import pyqtgraph as pqtg
 
 # Global aesthetic configs
 INPUT_FIELDS_W = 80
 DISCONNECT_LITERAL = "[від'єднати]" # Is used to reduce the amount of buttons on the tool panel
+
+# Validators, exported into the global namespace for convenience and mem management
+positiveOnly = QIntValidator()
+positiveOnly.setBottom(1)
+positDoublesOnly = QDoubleValidator()
+positDoublesOnly.setBottom(0)
+doublesOnly = QDoubleValidator() # Uses commas as float separator
+
+importantFont = QFont()
+importantFont.setBold(True)
+importantFont.setPointSize(14)
+
+# pen = pqtg.mkPen(color=(255,255,255), width=2)
 
 class MainWindow(pswidg.QMainWindow):
     def __init__(self) -> None:
@@ -24,21 +38,11 @@ class MainWindow(pswidg.QMainWindow):
         # anything else - tries to connect to that port with the given parameters.
 
         self.dataQueue = queue.Queue() # to prevent the UARTWorker raising RuntimeErrors due to the widget already being destroyed
-        self.dataBuffer = [ # This is a temporary data displaying solution.
-            [0,0,0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0,0,0],
-            [0,0,0,0,0,0,0,0,0,0]
-        ]
 
         self.setWindowTitle("Multichannel Experimental Data Reader")
         primaryContainer = pswidg.QWidget()
         primaryLayout = pswidg.QVBoxLayout(primaryContainer)
         primaryLayout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        # Input field validator for positive ints, exported into the object namespace because it is used ubiquitously
-        self.positiveOnly = QIntValidator()
-        self.positiveOnly.setBottom(1)
 
         # Controls bar
         controlsContainer = pswidg.QWidget()
@@ -60,7 +64,7 @@ class MainWindow(pswidg.QMainWindow):
         )
         self.baudrateCBox.setCurrentText('9600') # this is by far the most standard baudrate along with 115200
         self.baudrateCBox.setEditable(True)
-        self.baudrateCBox.setValidator(self.positiveOnly)
+        self.baudrateCBox.setValidator(positiveOnly)
 
         # Data bits
         NBitsLabel = pswidg.QLabel("Бітів даних:")
@@ -164,14 +168,9 @@ class MainWindow(pswidg.QMainWindow):
 
                 for i in range(min(len(dataIn), nChannels)):
                     try:
-                        scaleStr = self.channelComponents[i]['scale'].text().replace(',','.')
-                        zeroOffStr = self.channelComponents[i]['zeroOffset'].text().replace(',','.')
-                        scaling = float(scaleStr if scaleStr else '1')
-                        zeroOffset = float(zeroOffStr if zeroOffStr else '0')
-                        inputModified = float(dataIn[i])*scaling+zeroOffset # to raise ValueError as early as possible in case of wrong code
-                        self.dataBuffer[i][0:9] = self.dataBuffer[i][1:]
-                        self.dataBuffer[i][9] = inputModified
-                        self.channelComponents[i]['output'].setText(f'Значення: {self.dataBuffer[i]}')
+                        inputRaw = float(dataIn[i]) # to raise ValueError as early as possible in case of wrong data
+                        self.channelComponents[i]['data'].append(inputRaw)
+                        self.updateChannelData(i)
                         self.status.showMessage('Дані прийнято без помилок.')
                     except ValueError:
                         self.status.showMessage(f'⚠️ Некоректні параметри або дані на вході каналу №{i+1}: {dataIn[i]}')
@@ -180,6 +179,16 @@ class MainWindow(pswidg.QMainWindow):
                     self.status.showMessage(f'Забагато даних на вході, відображаються {nChannels}/{len(dataIn)} каналів.')
             except UnicodeDecodeError:
                 self.status.showMessage(f'⚠️ Неможливо декодувати символи.')
+    
+    def updateChannelData(self, i: int) -> None:
+        """Updates the given channel's data graph."""
+        scaling = self.channelComponents[i]['scale']
+        zeroOffset = self.channelComponents[i]['zeroOffset']
+
+        xAxis = [x/(self.channelComponents[i]['discr'] if self.channelComponents[i]['discr'] else 1) for x in range(len(self.channelComponents[i]['data']))]
+        yAxis = [y*scaling+zeroOffset for y in self.channelComponents[i]['data']]
+
+        self.channelComponents[i]['line'].setData(xAxis, yAxis)
 
     def updateChannelLayout(self) -> None:
         """Expands or contracts the number of channels to match the amount required."""
@@ -199,52 +208,44 @@ class MainWindow(pswidg.QMainWindow):
         """Spawns a new channel widget with the given identifier, and adds it to the grid."""
         comp = pswidg.QWidget()
         VBLayout = pswidg.QVBoxLayout(comp)
+        title = pswidg.QWidget()
+        titleHBox = pswidg.QHBoxLayout(title)
         chName = pswidg.QLabel(f'Канал №{ident+1}')
-        output = pswidg.QLabel('Значення: ---') # Will be replaced by graphs in the future
+        chName.setFont(importantFont)
+        graph = pqtg.PlotWidget()
+        graph.setLabel('left', 'Величина, од.')
+        graph.setLabel('bottom', 'Час, сек.')
+        graph.showGrid(True, True)
+        line = graph.plot([],[],)# pen=pen)
 
-        # subcontrols layout
-        subctrl = pswidg.QWidget()
-        subctrlHBox = pswidg.QHBoxLayout(subctrl)
-        subctrlHBox.setAlignment(Qt.AlignmentFlag.AlignLeft)
-
-        sub_discrLabel = pswidg.QLabel("Част. дискретизації:")
-        sub_discr = pswidg.QLineEdit('0')
-        sub_discr.setValidator(self.positiveOnly)
-        sub_discr.setFixedWidth(INPUT_FIELDS_W)
-
-        doublesOnly = QDoubleValidator() # Uses commas as float separator
-        sub_scaleLabel = pswidg.QLabel("Масштаб:")
-        sub_scale = pswidg.QLineEdit('1')
-        sub_scale.setFixedWidth(INPUT_FIELDS_W)
-        sub_scale.setValidator(doublesOnly)
-
-        sub_zeroOffsetLabel = pswidg.QLabel("Зміщення:")
-        sub_zeroOffset = pswidg.QLineEdit('0')
-        sub_zeroOffset.setValidator(doublesOnly)
-        sub_zeroOffset.setFixedWidth(INPUT_FIELDS_W)
-
-        # subcontrols adding
-        subctrlHBox.addWidget(sub_discrLabel)
-        subctrlHBox.addWidget(sub_discr)
-        subctrlHBox.addWidget(sub_scaleLabel)
-        subctrlHBox.addWidget(sub_scale)
-        subctrlHBox.addWidget(sub_zeroOffsetLabel)
-        subctrlHBox.addWidget(sub_zeroOffset)
+        configSummoner = pswidg.QPushButton("Налаштувати...")
+        configSummoner.setFixedWidth(INPUT_FIELDS_W*2)
+        configSummoner.clicked.connect(lambda: self.summonConfig(ident))
 
         # integration
-        VBLayout.addWidget(chName)
-        VBLayout.addWidget(subctrl)
-        VBLayout.addWidget(output)
+        titleHBox.addWidget(chName)
+        titleHBox.addWidget(configSummoner)
+        VBLayout.addWidget(title)
+        VBLayout.addWidget(graph)
 
         self.channelsLayout.addWidget(comp, ident//2, ident%2) # positioning
         compdict = {
             "widget": comp,
-            "discr": sub_discr,
-            "scale": sub_scale,
-            "zeroOffset": sub_zeroOffset,
-            "output": output
+            "chName": chName,
+            "discr": 1,
+            "scale": 1,
+            "zeroOffset": 0,
+            "unit": "од.",
+            "graph": graph,
+            "line": line,
+            "data": []
         }
         self.channelComponents.append(compdict)
+
+    def summonConfig(self, channel: int) -> None:
+        """Summons a config window for a given channel."""
+        self.cwindow = ConfigWindow(self, channel)
+        self.cwindow.show()
 
     def refreshUART(self) -> None:
         """Updates the portCBox combobox to reflect the amount of UARTs available."""
@@ -293,6 +294,86 @@ class MainWindow(pswidg.QMainWindow):
         # self.isRunning = False
         self.commandQueue.put_nowait('$QUIT')
 
+class ConfigWindow(pswidg.QMainWindow):
+    def __init__(self, mainwindow: MainWindow, channel: int) -> None:
+        super().__init__()
+        self.mainwindow = mainwindow
+        self.channelNum = channel
+        self.setWindowTitle(f"Налаштування каналу {channel+1}")
+
+        # subcontrols layout
+        subctrl = pswidg.QWidget()
+        subctrlVBox = pswidg.QVBoxLayout(subctrl)
+        subctrlVBox.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        titleLabel = pswidg.QLabel(f"Канал №{channel+1}:")
+        titleLabel.setFont(importantFont)
+
+        sub_chNameLabel = pswidg.QLabel("Назва каналу:")
+        self.sub_chName = pswidg.QLineEdit(
+            self.mainwindow.channelComponents[self.channelNum]['chName'].text()
+        )
+        self.sub_chName.textChanged.connect(self.updateChannel)
+
+        sub_discrLabel = pswidg.QLabel("Частота дискретизації в Герцах:")
+        self.sub_discr = pswidg.QLineEdit(
+            str( self.mainwindow.channelComponents[self.channelNum]['discr'] ).replace('.', ',')
+        )
+        self.sub_discr.setValidator(positDoublesOnly)
+        self.sub_discr.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_discr.textChanged.connect(self.updateChannel)
+
+        sub_unitLabel = pswidg.QLabel("Одиниці вимірювання осі Y:")
+        self.sub_unit = pswidg.QLineEdit(
+            self.mainwindow.channelComponents[self.channelNum]['unit']
+        )
+        self.sub_unit.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_unit.textChanged.connect(self.updateChannel)
+
+        sub_scaleLabel = pswidg.QLabel("Масштаб осі Y (можна й від'ємний):")
+        self.sub_scale = pswidg.QLineEdit(
+            str( self.mainwindow.channelComponents[self.channelNum]['scale'] ).replace('.', ',')
+        )
+        self.sub_scale.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_scale.setValidator(doublesOnly)
+        self.sub_scale.textChanged.connect(self.updateChannel)
+
+        sub_zeroOffsetLabel = pswidg.QLabel("Зміщення осі Y в заданих одиницях:")
+        self.sub_zeroOffset = pswidg.QLineEdit(
+            str( self.mainwindow.channelComponents[self.channelNum]['zeroOffset'] ).replace('.', ',')
+        )
+        self.sub_zeroOffset.setValidator(doublesOnly)
+        self.sub_zeroOffset.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_zeroOffset.textChanged.connect(self.updateChannel)
+
+        # subcontrols adding
+        subctrlVBox.addWidget(titleLabel)
+        subctrlVBox.addWidget(sub_chNameLabel)
+        subctrlVBox.addWidget(self.sub_chName)
+        subctrlVBox.addWidget(sub_discrLabel)
+        subctrlVBox.addWidget(self.sub_discr)
+        subctrlVBox.addWidget(sub_unitLabel)
+        subctrlVBox.addWidget(self.sub_unit)
+        subctrlVBox.addWidget(sub_scaleLabel)
+        subctrlVBox.addWidget(self.sub_scale)
+        subctrlVBox.addWidget(sub_zeroOffsetLabel)
+        subctrlVBox.addWidget(self.sub_zeroOffset)
+        self.setCentralWidget(subctrl)
+
+    def updateChannel(self) -> None:
+        discr = self.sub_discr.text() # the if value: set value thing is done to prevent empty fields from raising ValueErrors
+        scale = self.sub_scale.text()
+        zeroOffset = self.sub_zeroOffset.text()
+        unit = self.sub_unit.text()
+        chName = self.sub_chName.text()
+        if discr: self.mainwindow.channelComponents[self.channelNum]['discr'] = float(discr.replace(',', '.'))
+        if scale: self.mainwindow.channelComponents[self.channelNum]['scale'] = float(scale.replace(',', '.'))
+        if zeroOffset: self.mainwindow.channelComponents[self.channelNum]['zeroOffset'] = float(zeroOffset.replace(',', '.'))
+        if unit: 
+            self.mainwindow.channelComponents[self.channelNum]['unit'] = unit
+            self.mainwindow.channelComponents[self.channelNum]['graph'].setLabel('left', f"Величина, {unit}")
+        if chName: self.mainwindow.channelComponents[self.channelNum]['chName'].setText(chName)
+        self.mainwindow.updateChannelData(self.channelNum)
+
 class UARTWorker(QRunnable):
     def __init__(self, mainwindow: MainWindow) -> None:
         super().__init__()
@@ -301,6 +382,7 @@ class UARTWorker(QRunnable):
     @Slot()
     def run(self) -> None:
         isRunning = True
+        # TestCounter = 1
         while isRunning:
             try:
                 if not self.mainwindow.commandQueue.empty():
@@ -326,6 +408,9 @@ class UARTWorker(QRunnable):
                     databytes = self.mainwindow.serial.readline()
                     self.mainwindow.dataQueue.put_nowait(databytes)
                 else:
+                    # if len(self.mainwindow.channelComponents) == 4:
+                    #     self.mainwindow.dataQueue.put_nowait(bytes(f'{TestCounter} {1/TestCounter} {TestCounter**2} {TestCounter**0.5}', encoding='ascii'))
+                    #     TestCounter+=1
                     sleep(0.1) # to prevent GUI performance sagging by the thread
             except serial.SerialException as exc:
                 self.mainwindow.serial.close()
