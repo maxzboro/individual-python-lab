@@ -10,6 +10,7 @@ import pyqtgraph as pqtg
 # Global aesthetic configs
 INPUT_FIELDS_W = 80
 DISCONNECT_LITERAL = "[від'єднати]" # Is used to reduce the amount of buttons on the tool panel
+TESTING_LITERAL = "[тестувати]"
 
 # Validators, exported into the global namespace for convenience and mem management
 positiveOnly = QIntValidator()
@@ -249,7 +250,7 @@ class MainWindow(pswidg.QMainWindow):
 
     def refreshUART(self) -> None:
         """Updates the portCBox combobox to reflect the amount of UARTs available."""
-        uarts = [DISCONNECT_LITERAL]
+        uarts = [DISCONNECT_LITERAL, TESTING_LITERAL]
 
         for port in comports():
             uarts.append(port.name)
@@ -382,7 +383,8 @@ class UARTWorker(QRunnable):
     @Slot()
     def run(self) -> None:
         isRunning = True
-        # TestCounter = 1
+        TestCounter = 1
+        isTesting = False
         while isRunning:
             try:
                 if not self.mainwindow.commandQueue.empty():
@@ -390,27 +392,29 @@ class UARTWorker(QRunnable):
                     self.mainwindow.serial.close()
                     print(f'> {command}')
                     match command:
-                        case '$CLOSE': pass
+                        case '$CLOSE': isTesting = False
                         case '$QUIT': isRunning = False
                         case other:
                             params = other.split()
-                            if(len(params) == 5):
-                                self.mainwindow.serial = serial.Serial(
-                                    port=params[0],
-                                    baudrate=int(params[1]),
-                                    bytesize=int(params[2]),
-                                    parity=params[3],
-                                    stopbits=float(params[4]),
-                                    timeout=5
-                                )
+                            isTesting = params[0] == TESTING_LITERAL
+                            if(not isTesting):
+                                if(len(params) == 5):
+                                    self.mainwindow.serial = serial.Serial(
+                                        port=params[0],
+                                        baudrate=int(params[1]),
+                                        bytesize=int(params[2]),
+                                        parity=params[3],
+                                        stopbits=float(params[4]),
+                                        timeout=5
+                                    )
 
                 if(self.mainwindow.serial.is_open):
                     databytes = self.mainwindow.serial.readline()
                     self.mainwindow.dataQueue.put_nowait(databytes)
                 else:
-                    # if len(self.mainwindow.channelComponents) == 4:
-                    #     self.mainwindow.dataQueue.put_nowait(bytes(f'{TestCounter} {1/TestCounter} {TestCounter**2} {TestCounter**0.5}', encoding='ascii'))
-                    #     TestCounter+=1
+                    if isTesting:
+                        self.mainwindow.dataQueue.put_nowait(bytes(f'{TestCounter} {1/TestCounter} {TestCounter**2} {TestCounter**0.5}', encoding='ascii'))
+                        TestCounter+=1
                     sleep(0.1) # to prevent GUI performance sagging by the thread
             except serial.SerialException as exc:
                 self.mainwindow.serial.close()
