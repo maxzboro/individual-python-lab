@@ -1,5 +1,5 @@
 import PySide6.QtWidgets as pswidg
-from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator, QFont
+from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator, QFont, QActionGroup, QAction
 from PySide6.QtCore import QTimer, QRunnable, Slot, QThreadPool
 import serial
 from serial.tools.list_ports import comports
@@ -23,8 +23,6 @@ importantFont = QFont()
 importantFont.setBold(True)
 importantFont.setPointSize(14)
 
-# pen = pqtg.mkPen(color=(255,255,255), width=2)
-
 class MainWindow(pswidg.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -32,6 +30,7 @@ class MainWindow(pswidg.QMainWindow):
         # Serial port instance and control
         self.serial = serial.Serial()
         self.commandQueue = queue.Queue() # to prevent race conditions such as trying to change the port during a read
+        self.separator = ' '
         # UARTWorker commands (the $ prefix is used because there are no dollar signs in COM names)
         # ---
         # $CLOSE - close the serial connection;
@@ -45,63 +44,52 @@ class MainWindow(pswidg.QMainWindow):
         primaryLayout = pswidg.QVBoxLayout(primaryContainer)
         primaryLayout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # Controls bar
-        controlsContainer = pswidg.QWidget()
-        controlsLayout = pswidg.QHBoxLayout(controlsContainer)
+        menubar = self.menuBar()
+        fileMenu = menubar.addMenu('Файл')
+        uartMenu = menubar.addMenu('UART')
+        toolsMenu = menubar.addMenu('Інструменти') # for the future
 
-        # UART Port selector
-        portLabel = pswidg.QLabel("Порт:")
-        self.portCBox = pswidg.QComboBox()
-        self.portCBox.addItem(DISCONNECT_LITERAL)
-        self.portCBox.currentTextChanged.connect(self.setUART)
+        fileMenu.addAction('Вийти').triggered.connect(self.close)
 
-        # Baudrate
-        baudrateLabel = pswidg.QLabel("Швидкість передачі:")
-        self.baudrateCBox = pswidg.QComboBox()
-        self.baudrateCBox.addItems(
-            ('50', '75', '110', '134', '150', '200', '300', '600', '1200', '1800', \
-            '2400', '4800', '9600', '19200', '28800', '38400', '57600', '76800', \
-            '115200', '230400', '460800', '576000', '921600') # standard baudrates
-        )
-        self.baudrateCBox.setCurrentText('9600') # this is by far the most standard baudrate along with 115200
-        self.baudrateCBox.setEditable(True)
-        self.baudrateCBox.setValidator(positiveOnly)
+        # The UARTGen dict is as follows: Submenu name: (possible values, among which is the default)
+        # Items that start with asterisks are set to be default.
+        # Fun fact: the previous implementation used up twice as much lines of code and was more confusing to maintain.
+        self.uartConfigs: dict[str, QActionGroup] = {}
 
-        # Data bits
-        NBitsLabel = pswidg.QLabel("Бітів даних:")
-        self.NBitsCBox = pswidg.QComboBox()
-        self.NBitsCBox.addItems(('8','7','6','5')) # PySerial allows only these
+        uartgen_dict = {
+            'Port': ('*'+DISCONNECT_LITERAL, TESTING_LITERAL),
+            'Baudrate': ('50', '75', '110', '134', '150', '200', '300', '600', '1200', '1800', \
+            '2400', '4800', '*9600', '19200', '28800', '38400', '57600', '76800', \
+            '115200', '230400', '460800', '576000', '921600'), # for now no custom baudrates
+            'Data bits': ('*8','7','6','5'),
+            'Parity': ('*None', 'Even', 'Odd', 'Mark', 'Space'),
+            'Stop bits': ('*1', '2', '1.5'),
+            'Channels': ('*1', '2', '3', '4')
+        }
 
-        # Parity
-        parityLabel = pswidg.QLabel("Парність:")
-        self.parityCBox = pswidg.QComboBox()
-        self.parityCBox.addItems(('None', 'Even', 'Odd', 'Mark', 'Space'))
+        self.uartSubmenu: pswidg.QMenu = None
+        self.disconnTrigger: QAction = None
 
-        # Stop bits
-        stopLabel = pswidg.QLabel("Стоп-бітів:")
-        self.stopCBox = pswidg.QComboBox()
-        self.stopCBox.addItems(('1', '2', '1.5'))
+        for key in uartgen_dict:
+            ag = QActionGroup(self)
+            ag.setExclusive(True)
+            submenu = uartMenu.addMenu(key)
+            if(key == 'Port'): 
+                self.uartSubmenu = submenu
 
-        # Channel amount
-        nChanLabel = pswidg.QLabel("Каналів:")
-        nChanCBox = pswidg.QComboBox()
-        nChanCBox.addItems(('1', '2', '3', '4'))
-        nChanCBox.currentTextChanged.connect(self.updateChannelLayout)
+            for item in uartgen_dict[key]:
+                action = submenu.addAction(item.replace('*', ''))
+                if item == '*'+DISCONNECT_LITERAL: self.disconnTrigger = action
+                action.setCheckable(True)
+                ag.addAction(action)
+                if item[0] == '*': action.setChecked(True)
 
-        # Making on-the-fly adjustments possible
-        self.baudrateCBox.currentTextChanged.connect(self.setUART)
-        self.NBitsCBox.currentTextChanged.connect(self.setUART)
-        self.parityCBox.currentTextChanged.connect(self.setUART)
-        self.stopCBox.currentTextChanged.connect(self.setUART)
+            self.uartConfigs[key] = ag
+            ag.triggered.connect(self.updateChannelLayout if key=='Channels' else self.setUART)
 
-        # Text data separator
-        sepLabel = pswidg.QLabel('Роздільник: ')
-        self.separator = pswidg.QLineEdit()
-        self.separator.setFixedWidth(INPUT_FIELDS_W)
-
-        # Separator line
-        guiSeparator = pswidg.QFrame()
-        guiSeparator.setFrameShape(pswidg.QFrame.Shape.HLine)
+        # Separator setter
+        setSeparator = uartMenu.addAction('Задати роздільник')
+        setSeparator.triggered.connect(self.setSeparatorDialog)
 
         # Grid layout for channels
         channels = pswidg.QWidget()
@@ -113,26 +101,9 @@ class MainWindow(pswidg.QMainWindow):
         # scale - scaling coefficient
         # zeroOffset - zero offset
         # output - data display controller
+        # FIXME THIS LIST IS OUTDATED!!!
         self.channelComponents = [] # used for later data retrieval
 
-        # Control panel integration
-        controlsLayout.addWidget(portLabel)
-        controlsLayout.addWidget(self.portCBox)
-        controlsLayout.addWidget(baudrateLabel)
-        controlsLayout.addWidget(self.baudrateCBox)
-        controlsLayout.addWidget(NBitsLabel)
-        controlsLayout.addWidget(self.NBitsCBox)
-        controlsLayout.addWidget(parityLabel)
-        controlsLayout.addWidget(self.parityCBox)
-        controlsLayout.addWidget(stopLabel)
-        controlsLayout.addWidget(self.stopCBox)
-        controlsLayout.addWidget(nChanLabel)        
-        controlsLayout.addWidget(nChanCBox)
-        controlsLayout.addWidget(sepLabel)
-        controlsLayout.addWidget(self.separator)
-
-        primaryLayout.addWidget(controlsContainer)
-        primaryLayout.addWidget(guiSeparator)
         primaryLayout.addWidget(channels)
 
         self.setCentralWidget(primaryContainer)
@@ -159,10 +130,14 @@ class MainWindow(pswidg.QMainWindow):
         self.dataPullTimer.timeout.connect(self.pullData)
         self.dataPullTimer.start()
 
+    def setSeparatorDialog(self) -> None:
+        self.sepDiag = SeparatorDialog(self)
+        self.sepDiag.show()
+
     def pullData(self) -> None:
         while not self.dataQueue.empty():
             databytes = self.dataQueue.get_nowait()
-            sep = self.separator.text()
+            sep = self.separator
             try:
                 dataIn = str(databytes, encoding='ascii').split(sep if sep else ' ')
                 nChannels = len(self.channelComponents)
@@ -199,7 +174,7 @@ class MainWindow(pswidg.QMainWindow):
 
     def updateChannelLayout(self) -> None:
         """Expands or contracts the number of channels to match the amount required."""
-        required = int(self.sender().currentText())
+        required = int(self.uartConfigs['Channels'].checkedAction().text())
         current = len(self.channelComponents)
 
         if(current > required):
@@ -223,7 +198,7 @@ class MainWindow(pswidg.QMainWindow):
         graph.setLabel('left', 'Величина, од.')
         graph.setLabel('bottom', 'Час, сек.')
         graph.showGrid(True, True)
-        line = graph.plot([],[],)# pen=pen)
+        line = graph.plot([],[],)
 
         configSummoner = pswidg.QPushButton("Налаштувати...")
         configSummoner.setFixedWidth(INPUT_FIELDS_W*2)
@@ -260,33 +235,38 @@ class MainWindow(pswidg.QMainWindow):
     def refreshUART(self) -> None:
         """Updates the portCBox combobox to reflect the amount of UARTs available."""
         uarts = [DISCONNECT_LITERAL, TESTING_LITERAL]
+        currentPort = self.uartConfigs['Port'].checkedAction().text()
 
         for port in comports():
             uarts.append(port.name)
         
         present = [] # uarts currently present
 
-        length = self.portCBox.count()
-        for i in range(length):
-            present.append(self.portCBox.itemText(i))
+        for port in self.uartConfigs['Port'].actions():
+            present.append(port.text())
 
         to_remove = set(present)-set(uarts) # using sets prevents entry duplication
         to_add = set(uarts)-set(present)
 
-        # first remove old elements, then add new ones
-        for i in range(length):
-            itext = self.portCBox.itemText(i)
-            if itext in to_remove: self.portCBox.removeItem(i)
+        for port in self.uartConfigs['Port'].actions():
+            port_name = port.text()
+            if port_name in to_remove:
+                if port_name == currentPort:
+                    self.disconnTrigger.trigger() # Previously impossible
+                self.uartConfigs['Port'].removeAction(port)
+                self.uartSubmenu.removeAction(port)
 
-        for item in to_add:
-            self.portCBox.addItem(item)
+        for port_name in sorted(to_add): # for aesthetic purposes
+            port = self.uartSubmenu.addAction(port_name)
+            port.setCheckable(True)
+            self.uartConfigs['Port'].addAction(port)
 
     def setUART(self) -> None:
         """Sends appropriate commands to the UARTWorker to update its config."""
-        port = self.portCBox.currentText()
-        baudrate = self.baudrateCBox.currentText()
-        nBits = self.NBitsCBox.currentText()
-        stopbits = self.stopCBox.currentText()
+        port = self.uartConfigs['Port'].checkedAction().text()
+        baudrate = self.uartConfigs['Baudrate'].checkedAction().text()
+        nBits = self.uartConfigs['Data bits'].checkedAction().text()
+        stopbits = self.uartConfigs['Stop bits'].checkedAction().text()
         parityMap = {
             "None" : serial.PARITY_NONE,
             "Even": serial.PARITY_EVEN,
@@ -298,7 +278,7 @@ class MainWindow(pswidg.QMainWindow):
         if port == DISCONNECT_LITERAL:
             self.commandQueue.put_nowait('$CLOSE')
         else:
-            self.commandQueue.put_nowait(f'{port} {baudrate} {nBits} {parityMap[self.parityCBox.currentText()]} {stopbits}')
+            self.commandQueue.put_nowait(f'{port} {baudrate} {nBits} {parityMap[self.uartConfigs['Parity'].checkedAction().text()]} {stopbits}')
 
     def cleanup(self) -> None: # releases UART ports, saves all files, etc when quitting the app
         # self.isRunning = False
@@ -413,6 +393,28 @@ class ConfigWindow(pswidg.QMainWindow):
         if tw1: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = float(tw1.replace(',', '.'))
         else: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = -1
         self.mainwindow.updateChannelData(self.channelNum)
+
+class SeparatorDialog(pswidg.QMainWindow):
+    def __init__(self, mainwindow: MainWindow) -> None:
+        super().__init__()
+        self.mainwindow = mainwindow
+        self.setWindowTitle("Введіть роздільник")
+        mainContainer = pswidg.QWidget()
+        mainLayout = pswidg.QVBoxLayout(mainContainer)
+        mainLayout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        helpText = pswidg.QLabel("Введіть новий роздільник:")
+        self.sepInput = pswidg.QLineEdit()
+        okBtn = pswidg.QPushButton('Підтвердити')
+        okBtn.clicked.connect(self.finalize)
+        mainLayout.addWidget(helpText)
+        mainLayout.addWidget(self.sepInput)
+        mainLayout.addWidget(okBtn)
+        self.setCentralWidget(mainContainer)
+
+    def finalize(self) -> None:
+        self.mainwindow.separator = self.sepInput.text()
+        self.close()
+
 
 class UARTWorker(QRunnable):
     def __init__(self, mainwindow: MainWindow) -> None:
