@@ -189,6 +189,12 @@ class MainWindow(pswidg.QMainWindow):
         xAxis = [x/(self.channelComponents[i]['discr'] if self.channelComponents[i]['discr'] else 1) for x in range(len(self.channelComponents[i]['data']))]
         yAxis = [y*scaling+zeroOffset for y in self.channelComponents[i]['data']]
 
+        tw1 = self.channelComponents[i]['timeWindow1']
+        self.channelComponents[i]['line'].getViewBox().setXRange(
+            self.channelComponents[i]['timeWindow0'],
+            tw1 if tw1!=-1 else xAxis[-1]
+        )
+
         self.channelComponents[i]['line'].setData(xAxis, yAxis)
 
     def updateChannelLayout(self) -> None:
@@ -239,8 +245,11 @@ class MainWindow(pswidg.QMainWindow):
             "unit": "од.",
             "graph": graph,
             "line": line,
-            "data": []
+            "data": [],
+            "timeWindow0": 0,
+            "timeWindow1": -1
         }
+        line.getViewBox().register(f'Канал №{ident+1}')
         self.channelComponents.append(compdict)
 
     def summonConfig(self, channel: int) -> None:
@@ -297,6 +306,7 @@ class MainWindow(pswidg.QMainWindow):
 
 class ConfigWindow(pswidg.QMainWindow):
     def __init__(self, mainwindow: MainWindow, channel: int) -> None:
+        # TODO Optimize window creation routines!!
         super().__init__()
         self.mainwindow = mainwindow
         self.channelNum = channel
@@ -346,6 +356,23 @@ class ConfigWindow(pswidg.QMainWindow):
         self.sub_zeroOffset.setFixedWidth(INPUT_FIELDS_W)
         self.sub_zeroOffset.textChanged.connect(self.updateChannel)
 
+        self.sub_timeWindow0Label = pswidg.QLabel("Початок часового вікна (порожній - початок відліку):")
+        self.sub_timeWindow0 = pswidg.QLineEdit(
+            str( self.mainwindow.channelComponents[self.channelNum]['timeWindow0'] ).replace('.', ',')
+        )
+        self.sub_timeWindow0.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_timeWindow0.setValidator(positDoublesOnly)
+        self.sub_timeWindow0.textChanged.connect(self.updateChannel)
+
+        self.sub_timeWindow1Label = pswidg.QLabel("Кінець часового вікна (порожній - остання точка даних):")
+        tw1 = self.mainwindow.channelComponents[self.channelNum]['timeWindow1']
+        self.sub_timeWindow1 = pswidg.QLineEdit(
+            str(tw1).replace('.', ',') if tw1!=-1 else ''
+        )
+        self.sub_timeWindow1.setFixedWidth(INPUT_FIELDS_W)
+        self.sub_timeWindow1.setValidator(positDoublesOnly)
+        self.sub_timeWindow1.textChanged.connect(self.updateChannel)
+
         # subcontrols adding
         subctrlVBox.addWidget(titleLabel)
         subctrlVBox.addWidget(sub_chNameLabel)
@@ -358,6 +385,10 @@ class ConfigWindow(pswidg.QMainWindow):
         subctrlVBox.addWidget(self.sub_scale)
         subctrlVBox.addWidget(sub_zeroOffsetLabel)
         subctrlVBox.addWidget(self.sub_zeroOffset)
+        subctrlVBox.addWidget(self.sub_timeWindow0Label)
+        subctrlVBox.addWidget(self.sub_timeWindow0)
+        subctrlVBox.addWidget(self.sub_timeWindow1Label)
+        subctrlVBox.addWidget(self.sub_timeWindow1)
         self.setCentralWidget(subctrl)
 
     def updateChannel(self) -> None:
@@ -366,13 +397,21 @@ class ConfigWindow(pswidg.QMainWindow):
         zeroOffset = self.sub_zeroOffset.text()
         unit = self.sub_unit.text()
         chName = self.sub_chName.text()
+        tw0 = self.sub_timeWindow0.text()
+        tw1 = self.sub_timeWindow1.text()
         if discr: self.mainwindow.channelComponents[self.channelNum]['discr'] = float(discr.replace(',', '.'))
         if scale: self.mainwindow.channelComponents[self.channelNum]['scale'] = float(scale.replace(',', '.'))
         if zeroOffset: self.mainwindow.channelComponents[self.channelNum]['zeroOffset'] = float(zeroOffset.replace(',', '.'))
         if unit: 
             self.mainwindow.channelComponents[self.channelNum]['unit'] = unit
             self.mainwindow.channelComponents[self.channelNum]['graph'].setLabel('left', f"Величина, {unit}")
-        if chName: self.mainwindow.channelComponents[self.channelNum]['chName'].setText(chName)
+        if chName: 
+            self.mainwindow.channelComponents[self.channelNum]['chName'].setText(chName)
+            self.mainwindow.channelComponents[self.channelNum]['line'].getViewBox().register(chName) # FIXME works poorly with renaming channels
+        if tw0: self.mainwindow.channelComponents[self.channelNum]['timeWindow0'] = float(tw0.replace(',', '.'))
+        else: self.mainwindow.channelComponents[self.channelNum]['timeWindow0'] = 0
+        if tw1: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = float(tw1.replace(',', '.'))
+        else: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = -1
         self.mainwindow.updateChannelData(self.channelNum)
 
 class UARTWorker(QRunnable):
