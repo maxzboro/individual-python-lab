@@ -31,6 +31,7 @@ class MainWindow(pswidg.QMainWindow):
         self.serial = serial.Serial()
         self.commandQueue = queue.Queue() # to prevent race conditions such as trying to change the port during a read
         self.separator = ' '
+        self.customBaudrate = 9600
         # UARTWorker commands (the $ prefix is used because there are no dollar signs in COM names)
         # ---
         # $CLOSE - close the serial connection;
@@ -60,7 +61,7 @@ class MainWindow(pswidg.QMainWindow):
             'Port': ('*'+DISCONNECT_LITERAL, TESTING_LITERAL),
             'Baudrate': ('50', '75', '110', '134', '150', '200', '300', '600', '1200', '1800', \
             '2400', '4800', '*9600', '19200', '28800', '38400', '57600', '76800', \
-            '115200', '230400', '460800', '576000', '921600'), # for now no custom baudrates
+            '115200', '230400', '460800', '576000', '921600'),
             'Data bits': ('*8','7','6','5'),
             'Parity': ('*None', 'Even', 'Odd', 'Mark', 'Space'),
             'Stop bits': ('*1', '2', '1.5'),
@@ -88,8 +89,10 @@ class MainWindow(pswidg.QMainWindow):
             ag.triggered.connect(self.updateChannelLayout if key=='Channels' else self.setUART)
 
         # Separator setter
-        setSeparator = uartMenu.addAction('Задати роздільник')
+        setSeparator = uartMenu.addAction('Задати роздільник...')
         setSeparator.triggered.connect(self.setSeparatorDialog)
+        setCustomBaud = uartMenu.addAction('Нестандартний бодрейт...')
+        setCustomBaud.triggered.connect(self.setBaudrateDialog)
 
         # Grid layout for channels
         channels = pswidg.QWidget()
@@ -131,8 +134,19 @@ class MainWindow(pswidg.QMainWindow):
         self.dataPullTimer.start()
 
     def setSeparatorDialog(self) -> None:
-        self.sepDiag = SeparatorDialog(self)
+        self.sepDiag = TextInputDialog(self, 'separator', "Введіть роздільник", \
+                                        "Введіть новий роздільник:", default=self.separator)
         self.sepDiag.show()
+
+    def setBaudrateDialog(self) -> None:
+        self.rateDiag = TextInputDialog(self, 'customBaudrate', "Введіть бодрейт", \
+                                        "Введіть швидкість передачі даних", numtype='n',\
+                                        default=str(self.customBaudrate), after=self.setBaudrateAfter)
+        self.rateDiag.show()
+
+    def setBaudrateAfter(self) -> None:
+        self.uartConfigs['Baudrate'].checkedAction().setChecked(False)
+        self.setUART()
 
     def pullData(self) -> None:
         while not self.dataQueue.empty():
@@ -264,7 +278,11 @@ class MainWindow(pswidg.QMainWindow):
     def setUART(self) -> None:
         """Sends appropriate commands to the UARTWorker to update its config."""
         port = self.uartConfigs['Port'].checkedAction().text()
-        baudrate = self.uartConfigs['Baudrate'].checkedAction().text()
+        if self.uartConfigs['Baudrate'].checkedAction():
+            baudrate = self.uartConfigs['Baudrate'].checkedAction().text()
+            self.customBaudrate = int(baudrate)
+        else:
+            baudrate = self.customBaudrate
         nBits = self.uartConfigs['Data bits'].checkedAction().text()
         stopbits = self.uartConfigs['Stop bits'].checkedAction().text()
         parityMap = {
@@ -394,16 +412,26 @@ class ConfigWindow(pswidg.QMainWindow):
         else: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = -1
         self.mainwindow.updateChannelData(self.channelNum)
 
-class SeparatorDialog(pswidg.QMainWindow):
-    def __init__(self, mainwindow: MainWindow) -> None:
+class TextInputDialog(pswidg.QMainWindow):
+    def __init__(self, mainwindow: MainWindow, attrname: str, title: str, desc: str,\
+                  numtype: str=None, default: str=None, after=None) -> None:
         super().__init__()
         self.mainwindow = mainwindow
-        self.setWindowTitle("Введіть роздільник")
+        self.attrname = attrname
+        self.numtype = numtype
+        self.after = after
+        self.setWindowTitle(title)
         mainContainer = pswidg.QWidget()
         mainLayout = pswidg.QVBoxLayout(mainContainer)
         mainLayout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        helpText = pswidg.QLabel("Введіть новий роздільник:")
-        self.sepInput = pswidg.QLineEdit()
+        helpText = pswidg.QLabel(desc)
+        self.sepInput = pswidg.QLineEdit(default if default else '')
+        if numtype == 'n': # Positive ints only
+            self.sepInput.setValidator(positiveOnly)
+        elif numtype == '+': # Positive doubles only
+            self.sepInput.setValidator(positDoublesOnly)
+        elif numtype == '.': # Doubles only
+            self.sepInput.setValidator(doublesOnly)
         okBtn = pswidg.QPushButton('Підтвердити')
         okBtn.clicked.connect(self.finalize)
         mainLayout.addWidget(helpText)
@@ -412,8 +440,15 @@ class SeparatorDialog(pswidg.QMainWindow):
         self.setCentralWidget(mainContainer)
 
     def finalize(self) -> None:
-        self.mainwindow.separator = self.sepInput.text()
+        final = self.sepInput.text()
+        if self.numtype == 'n':
+            final = int(final)
+        elif self.numtype != None:
+            final = float(final)
+        self.mainwindow.__setattr__(self.attrname, final)
         self.close()
+        if self.after:
+            self.after()
 
 
 class UARTWorker(QRunnable):
