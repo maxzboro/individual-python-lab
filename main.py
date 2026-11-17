@@ -1,5 +1,5 @@
 import PySide6.QtWidgets as pswidg
-from PySide6.QtGui import Qt, QIntValidator, QDoubleValidator, QFont, QActionGroup, QAction
+from PySide6.QtGui import Qt, QActionGroup, QAction
 from PySide6.QtCore import QTimer, QRunnable, Slot, QThreadPool
 import serial
 from serial.tools.list_ports import comports
@@ -7,31 +7,9 @@ from time import sleep
 import queue
 import pyqtgraph as pqtg
 from math import sin
-from numpy import absolute
-
-# Global aesthetic configs
-INPUT_FIELDS_W = 80
-DISCONNECT_LITERAL = "[від'єднати]" # Is used to reduce the amount of buttons on the tool panel
-TESTING_LITERAL = "[тестувати]"
-
-# Validators, exported into the global namespace for convenience and mem management
-positiveOnly = QIntValidator()
-positiveOnly.setBottom(1)
-positDoublesOnly = QDoubleValidator()
-positDoublesOnly.setBottom(0)
-doublesOnly = QDoubleValidator() # Uses commas as float separator
-
-importantFont = QFont()
-importantFont.setBold(True)
-importantFont.setPointSize(14)
-boldFont = QFont()
-boldFont.setBold(True)
-
-def process_time_window(twin: float, maxtime: float) -> float:
-    if twin is None or abs(twin)>maxtime: # handling invalid time window specs
-        return maxtime
-    else:
-        return twin if twin>=0 else maxtime+twin # negative means subtract from last
+from globals import *
+from tools import CursorTool
+import struct
 
 class MainWindow(pswidg.QMainWindow):
     def __init__(self) -> None:
@@ -41,6 +19,10 @@ class MainWindow(pswidg.QMainWindow):
         self.serial = serial.Serial()
         self.commandQueue = queue.Queue() # to prevent race conditions such as trying to change the port during a read
         self.separator = ' '
+        self.encoding = 'ascii'
+        self.isBinaryMode = False
+        self.binFormat = list('dddd')
+        self.endianness = 'Native'
         self.customBaudrate = 9600
         # UARTWorker commands (the $ prefix is used because there are no dollar signs in COM names)
         # ---
@@ -51,7 +33,7 @@ class MainWindow(pswidg.QMainWindow):
         self.dataQueue = queue.Queue() # to prevent the UARTWorker raising RuntimeErrors due to the widget already being destroyed
         self.curtool = None # window handle stubs, to be later destroyed by cleanup
         self.cwindow = None
-        self.sepDiag = None
+        self.fmtEditor = None
         self.rateDiag = None
 
         self.setWindowTitle("Multichannel Experimental Data Reader")
@@ -105,8 +87,8 @@ class MainWindow(pswidg.QMainWindow):
             ag.triggered.connect(self.updateChannelLayout if key=='Channels' else self.setUART)
 
         # Separator setter
-        setSeparator = uartMenu.addAction('Задати роздільник...')
-        setSeparator.triggered.connect(self.setSeparatorDialog)
+        setFormat = uartMenu.addAction('Задати формат...')
+        setFormat.triggered.connect(self.summonFormatEditor)
         setCustomBaud = uartMenu.addAction('Нестандартний бодрейт...')
         setCustomBaud.triggered.connect(self.setBaudrateDialog)
 
@@ -142,10 +124,9 @@ class MainWindow(pswidg.QMainWindow):
         self.dataPullTimer.timeout.connect(self.pullData)
         self.dataPullTimer.start()
 
-    def setSeparatorDialog(self) -> None:
-        self.sepDiag = TextInputDialog(self, 'separator', "Введіть роздільник", \
-                                        "Введіть новий роздільник:", default=self.separator)
-        self.sepDiag.show()
+    def summonFormatEditor(self) -> None:
+        self.fmtEditor = FormatEditor(self)
+        self.fmtEditor.show()
 
     def setBaudrateDialog(self) -> None:
         self.rateDiag = TextInputDialog(self, 'customBaudrate', "Введіть бодрейт", \
@@ -162,7 +143,13 @@ class MainWindow(pswidg.QMainWindow):
             databytes = self.dataQueue.get_nowait()
             sep = self.separator
             try:
-                dataIn = str(databytes, encoding='ascii').split(sep if sep else ' ')
+                if self.isBinaryMode:
+                    fmt = ENDIAN_DICT[self.endianness]
+                    for x in self.binFormat:
+                        fmt+=x
+                    dataIn = struct.unpack(fmt, databytes)
+                else:
+                    dataIn = str(databytes, encoding=self.encoding).split(sep if sep else ' ')
                 nChannels = len(self.channelComponents)
 
                 for i in range(min(len(dataIn), nChannels)):
@@ -318,9 +305,88 @@ class MainWindow(pswidg.QMainWindow):
 
     def closeEvent(self, event):
         self.commandQueue.put_nowait('$QUIT')
-        for win in [self.curtool,self.cwindow,self.sepDiag,self.rateDiag]:
+        for win in [self.curtool,self.cwindow,self.fmtEditor,self.rateDiag]:
             if win: win.close()
         return super().closeEvent(event)
+
+class FormatEditor(pswidg.QMainWindow):
+    def __init__(self, mainwindow: MainWindow) -> None:
+        super().__init__()
+        self.mainwindow = mainwindow
+        self.setWindowTitle(f'Налаштування формату введення/виведення')
+        mainContainer = pswidg.QWidget()
+        self.mainGrid = pswidg.QGridLayout(mainContainer)
+        self.mainGrid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        modeSetLabel = pswidg.QLabel('Режим прийому даних:')
+        self.modeCBox = pswidg.QComboBox()
+        self.modeCBox.addItems(['Текстовий', 'Двійковий'])
+        self.modeCBox.setCurrentIndex(int(self.mainwindow.isBinaryMode))
+        self.modeCBox.currentTextChanged.connect(self.updateConfigListings)
+        self.modeCBox.setFixedWidth(INPUT_FIELDS_W*1.5)
+        self.mainGrid.addWidget(modeSetLabel, 0, 0)
+        self.mainGrid.addWidget(self.modeCBox, 0, 1)
+
+        # holds references to config items as pairs (label, value)
+        self.configWidgets = []
+
+        self.setCentralWidget(mainContainer)
+        self.updateConfigListings()
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+
+    def updateConfigListings(self) -> None:
+        for pair in self.configWidgets:
+            pair[0].deleteLater()
+            pair[1].deleteLater()
+        self.configWidgets = []
+
+        self.mainwindow.isBinaryMode = self.modeCBox.currentText() == 'Двійковий'
+        if not self.mainwindow.isBinaryMode:
+            lbl = pswidg.QLabel('Роздільник:')
+            separator = pswidg.QLineEdit(self.mainwindow.separator)
+            separator.setFixedWidth(INPUT_FIELDS_W)
+            self.mainGrid.addWidget(lbl, 1, 0)
+            self.mainGrid.addWidget(separator, 1, 1)
+            separator.textChanged.connect(self.setTextSeparator)
+
+            encoderLbl = pswidg.QLabel('Кодування: ')
+            encoding = pswidg.QLineEdit(self.mainwindow.encoding)
+            encoding.setFixedWidth(INPUT_FIELDS_W)
+            self.mainGrid.addWidget(encoderLbl, 2, 0)
+            self.mainGrid.addWidget(encoding, 2, 1)
+            encoding.textChanged.connect(self.setEncoding)
+
+            self.configWidgets = [(lbl, separator), (encoderLbl, encoding)]
+        else:
+            for i in range(1, 5):
+                lbl = pswidg.QLabel(f'Тип даних каналу {i}:')
+                typeCBox = pswidg.QComboBox()
+                typeCBox.addItems(BINARY_FORMATS.keys())
+                typeCBox.chnlIndex = i-1
+                typeCBox.setCurrentText(BINARY_FORMATS_INV[self.mainwindow.binFormat[i-1]])
+                typeCBox.currentTextChanged.connect(self.setBinFormat)
+                self.mainGrid.addWidget(lbl, i, 0)
+                self.mainGrid.addWidget(typeCBox, i, 1)
+                self.configWidgets.append((lbl, typeCBox))
+            endiannessLbl = pswidg.QLabel('Порядок байтів:')
+            endiannessCBox = pswidg.QComboBox()
+            endiannessCBox.addItems(['Native', 'Big-Endian', 'Little-Endian'])
+            endiannessCBox.setCurrentText(self.mainwindow.endianness)
+            endiannessCBox.currentTextChanged.connect(self.setEndianness)
+            self.configWidgets.append((endiannessLbl, endiannessCBox))
+            self.mainGrid.addWidget(endiannessLbl, 5, 0)
+            self.mainGrid.addWidget(endiannessCBox, 5, 1)
+
+    def setBinFormat(self) -> None:
+        self.mainwindow.binFormat[self.sender().chnlIndex] = BINARY_FORMATS[self.sender().currentText()]
+
+    def setEndianness(self) -> None:
+        self.mainwindow.endianness = self.sender().currentText()
+
+    def setTextSeparator(self) -> None:
+        self.mainwindow.separator = self.sender().text()
+
+    def setEncoding(self) -> None:
+        self.mainwindow.encoding = self.sender().text()
 
 class ConfigWindow(pswidg.QMainWindow):
     def __init__(self, mainwindow: MainWindow, channel: int) -> None:
@@ -433,122 +499,6 @@ class ConfigWindow(pswidg.QMainWindow):
         else: self.mainwindow.channelComponents[self.channelNum]['timeWindow1'] = None
         self.mainwindow.updateChannelData(self.channelNum)
 
-class CursorTool(pswidg.QMainWindow):
-    def __init__(self, mainwindow: MainWindow) -> None:
-        super().__init__()
-        self.doSync = False
-        self.mainwindow = mainwindow
-        self.setWindowTitle('Інструмент "Курсори"')
-
-        self.updateTimer = QTimer(self)
-        self.updateTimer.setInterval(10)
-        self.updateTimer.timeout.connect(self.updateChannelAttachments)
-        self.updateTimer.start()
-
-        container = pswidg.QWidget()
-        self.componentGrid = pswidg.QGridLayout(container)
-        self.componentGrid.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.syncCheckBox = pswidg.QCheckBox('Синхронізувати')
-        self.componentGrid.addWidget(self.syncCheckBox,0,0)
-
-        col = 0
-        for heading in ['Назва каналу', 'Позиція 1', 'Позиція 2', 'Значення']:
-            label = pswidg.QLabel(heading)
-            label.setFont(boldFont)
-            self.componentGrid.addWidget(label, 1, col)
-            col+=1
-
-        # stores lists of the following structure:
-        # the cursor view widgets list for later deletion in the order [nameWidget, pos1, pos2, values]
-        self.cursorComponents = []
-        self.setCentralWidget(container)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-
-    def updateChannelAttachments(self) -> None:
-        required = len(self.mainwindow.channelComponents)
-        current = len(self.cursorComponents)
-
-        if(current > required):
-            for i in range(required, current):
-                for widget in self.cursorComponents[i]:
-                    widget.deleteLater()
-            for i in range(required, current):
-                del self.cursorComponents[required]
-        elif(required > current):
-            for i in range(current, required):
-                name = pswidg.QLabel(self.mainwindow.channelComponents[i]['chName'].text())
-                pos1 = pswidg.QLineEdit()
-                pos1.setFixedWidth(INPUT_FIELDS_W)
-                pos1.setValidator(doublesOnly)
-                pos2 = pswidg.QLineEdit()
-                pos2.setFixedWidth(INPUT_FIELDS_W)
-                pos2.setValidator(doublesOnly)
-                values = pswidg.QLabel("Значення: ---")
-
-                widgets = [name, pos1, pos2, values]
-                col = 0
-                for widget in widgets:
-                    self.componentGrid.addWidget(widget, i+2, col)
-                    col+=1
-
-                self.cursorComponents.append(widgets)
-
-        for i in range(len(self.cursorComponents)):
-            component = self.cursorComponents[i]
-            if i>0:
-                component[1].setReadOnly(self.syncCheckBox.isChecked())
-                component[2].setReadOnly(self.syncCheckBox.isChecked())
-                if(self.syncCheckBox.isChecked()):
-                    component[1].setText(self.cursorComponents[0][1].text())
-                    component[2].setText(self.cursorComponents[0][2].text())
-
-            if len(self.mainwindow.channelComponents[i]['data']) == 0: continue
-
-            maxtime = len(self.mainwindow.channelComponents[i]['data'])/self.mainwindow.channelComponents[i]['discr']
-            component[0].setText(self.mainwindow.channelComponents[i]['chName'].text())
-
-            try:
-                pos1 = component[1].text(); pos1 = process_time_window(float(pos1), maxtime) if pos1 else None
-                pos2 = component[2].text(); pos2 = process_time_window(float(pos2), maxtime) if pos2 else None
-            except ValueError:
-                pos1 = None
-                pos2 = None
-
-            self.mainwindow.channelComponents[i]['cursors'] = (pos1, pos2)
-            val1 = None
-            val2 = None
-            output = '---'
-
-            if not pos1 is None:
-                val1 = self.mainwindow.channelComponents[i]['data'][int(pos1*self.mainwindow.channelComponents[i]['discr'])]
-            if not pos2 is None:
-                val2 = self.mainwindow.channelComponents[i]['data'][int(pos2*self.mainwindow.channelComponents[i]['discr'])]
-
-            if pos1 == None and pos2 != None:
-                output = f'{val2} {self.mainwindow.channelComponents[i]['unit']}'
-                self.mainwindow.channelComponents[i]['cur1'].setData([],[])
-                self.mainwindow.channelComponents[i]['cur2'].setData([pos2],[val2])
-            elif pos1 != None and pos2 == None:
-                output = f'{val1} {self.mainwindow.channelComponents[i]['unit']}'
-                self.mainwindow.channelComponents[i]['cur1'].setData([pos1],[val1])
-                self.mainwindow.channelComponents[i]['cur2'].setData([],[])
-            elif pos1 != None and pos2 != None:
-                output = f'{val1}, {val2} {self.mainwindow.channelComponents[i]['unit']}'
-                self.mainwindow.channelComponents[i]['cur1'].setData([pos1],[val1])
-                self.mainwindow.channelComponents[i]['cur2'].setData([pos2],[val2])
-            else:
-                self.mainwindow.channelComponents[i]['cur1'].setData([],[])
-                self.mainwindow.channelComponents[i]['cur2'].setData([],[])
-
-            component[3].setText(f'Значення: {output}')
-
-    def closeEvent(self, event):
-        self.updateTimer.stop()
-        for component in self.mainwindow.channelComponents:
-            component['cur1'].setData([],[])
-            component['cur2'].setData([],[])
-        return super().closeEvent(event)
-
 class TextInputDialog(pswidg.QMainWindow):
     """A dialog window that asks the user to input a given piece of text and saves it to an attribute of the main window.
     You may optionally attach a validator for numeric types and a function to be called after the user hits OK.  
@@ -637,7 +587,13 @@ class UARTWorker(QRunnable):
                     self.mainwindow.dataQueue.put_nowait(databytes)
                 else:
                     if isTesting:
-                        self.mainwindow.dataQueue.put_nowait(bytes(f'{TestCounter} {1/TestCounter} {TestCounter**2} {sin(TestCounter*0.05)}', encoding='ascii'))
+                        if self.mainwindow.isBinaryMode:
+                            fmt = ENDIAN_DICT[self.endianness]
+                            for x in self.mainwindow.binFormat:
+                                fmt+=x
+                            self.mainwindow.dataQueue.put_nowait(struct.pack(fmt, TestCounter, 1/TestCounter, TestCounter**2, sin(TestCounter*0.05)))
+                        else:
+                            self.mainwindow.dataQueue.put_nowait(bytes(f'{TestCounter} {1/TestCounter} {TestCounter**2} {sin(TestCounter*0.05)}', encoding='ascii'))
                         TestCounter+=1
                     sleep(0.1) # to prevent GUI performance sagging by the thread
             except serial.SerialException as exc:
